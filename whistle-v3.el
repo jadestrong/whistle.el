@@ -1,4 +1,4 @@
-;;; whistle-v2.el --- Unified Whistle rules and values editor -*- lexical-binding: t; -*-
+;;; whistle-v3.el --- Advanced Whistle editor with isolation -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025
 
@@ -9,11 +9,14 @@
 
 ;;; Commentary:
 
-;; Unified buffer for editing both whistle rules and values.
-;; Format:
-;;   - Rules at the top (standard whistle syntax)
-;;   - Values as markdown code blocks: ```value-name\n...\n```
-;;   - Auto-completion for value names in rules
+;; Advanced Whistle editor with namespace isolation and metadata tracking.
+;; Features:
+;;   - Isolated namespace with `emacs:` prefix for rules
+;;   - Automatic value naming: emacs:rule-name:value-name
+;;   - Metadata tracking with hash-based conflict detection
+;;   - Local file persistence + server sync
+;;   - Cleanup utilities for orphaned values
+;;   - Migration support from V2
 
 ;;; Code:
 
@@ -55,6 +58,40 @@ Each rule is saved as RULE-NAME.whistle in this directory."
   :type 'string
   :group 'whistle)
 
+(defcustom whistle-rule-prefix "emacs"
+  "Prefix for Emacs-managed rules on the server.
+Rules are stored as PREFIX:rule-name (e.g., emacs:my-rule)."
+  :type 'string
+  :group 'whistle)
+
+(defcustom whistle-metadata-file
+  (expand-file-name "~/.whistle/metadata.json")
+  "File to store metadata for tracking rules and values."
+  :type 'file
+  :group 'whistle)
+
+(defcustom whistle-auto-backup t
+  "Whether to create backups before syncing."
+  :type 'boolean
+  :group 'whistle)
+
+(defcustom whistle-backup-directory
+  (expand-file-name "~/.whistle/backups/")
+  "Directory to store backups."
+  :type 'directory
+  :group 'whistle)
+
+(defcustom whistle-conflict-strategy 'prompt
+  "Strategy for handling conflicts.
+Possible values:
+  'prompt      - Ask user what to do
+  'server-wins - Always use server version
+  'local-wins  - Always use local version"
+  :type '(choice (const :tag "Prompt user" prompt)
+                 (const :tag "Server wins" server-wins)
+                 (const :tag "Local wins" local-wins))
+  :group 'whistle)
+
 ;;; Variables
 
 (defvar-local whistle--current-rule-name nil
@@ -68,6 +105,103 @@ Each rule is saved as RULE-NAME.whistle in this directory."
 
 (defvar-local whistle--file-path nil
   "Local file path for current rule.")
+
+(defvar whistle--metadata-cache nil
+  "Cached metadata loaded from file.")
+
+;;; Naming Utilities
+
+(defun whistle--server-rule-name (display-name)
+  "Convert display name to server name with prefix.
+Example: my-rule → emacs:my-rule"
+  (if (string-prefix-p (concat whistle-rule-prefix ":") display-name)
+      display-name  ; Already has prefix
+    (concat whistle-rule-prefix ":" display-name)))
+
+(defun whistle--display-rule-name (server-name)
+  "Convert server name to display name (remove prefix).
+Example: emacs:my-rule → my-rule"
+  (if (string-prefix-p (concat whistle-rule-prefix ":") server-name)
+      (substring server-name (+ 1 (length whistle-rule-prefix)))
+    server-name))
+
+(defun whistle--server-value-name (rule-name value-name)
+  "Get server value name with full namespace.
+Example: (my-rule, user-data) → emacs:my-rule:user-data"
+  (format "%s:%s:%s" whistle-rule-prefix rule-name value-name))
+
+(defun whistle--display-value-name (server-value-name)
+  "Extract display value name from server name.
+Example: emacs:my-rule:user-data → user-data"
+  (if (string-match (format "^%s:[^:]+:\\(.+\\)$" whistle-rule-prefix) server-value-name)
+      (match-string 1 server-value-name)
+    server-value-name))
+
+(defun whistle--is-emacs-managed-p (name)
+  "Check if NAME is managed by Emacs (has prefix)."
+  (string-prefix-p (concat whistle-rule-prefix ":") name))
+
+;;; Hash Utilities
+
+(defun whistle--calculate-hash (content)
+  "Calculate MD5 hash of CONTENT."
+  (md5 content))
+
+;;; Metadata System
+
+(defun whistle--load-metadata ()
+  "Load metadata from file."
+  (if (file-exists-p whistle-metadata-file)
+      (with-temp-buffer
+        (insert-file-contents whistle-metadata-file)
+        (let ((json-object-type 'alist)
+              (json-array-type 'list))
+          (setq whistle--metadata-cache (json-read))))
+    ;; Initialize empty metadata
+    (setq whistle--metadata-cache
+          '((rules . ())
+            (values . ())
+            (version . "3.0.0")
+            (lastSync . nil)))))
+
+(defun whistle--save-metadata ()
+  "Save metadata to file."
+  (let ((dir (file-name-directory whistle-metadata-file)))
+    (unless (file-exists-p dir)
+      (make-directory dir t)))
+  (with-temp-file whistle-metadata-file
+    (insert (json-encode whistle--metadata-cache))))
+
+(defun whistle--get-rule-metadata (rule-name)
+  "Get metadata for RULE-NAME (display name)."
+  (unless whistle--metadata-cache
+    (whistle--load-metadata))
+  (let ((server-name (whistle--server-rule-name rule-name)))
+    (alist-get (intern server-name)
+               (alist-get 'rules whistle--metadata-cache))))
+
+(defun whistle--update-rule-metadata (rule-name data)
+  "Update metadata for RULE-NAME with DATA."
+  (unless whistle--metadata-cache
+    (whistle--load-metadata))
+  (let* ((server-name (whistle--server-rule-name rule-name))
+         (rules (alist-get 'rules whistle--metadata-cache))
+         (updated-rules (cons (cons (intern server-name) data)
+                              (assq-delete-all (intern server-name) rules))))
+    (setf (alist-get 'rules whistle--metadata-cache) updated-rules)
+    (setf (alist-get 'lastSync whistle--metadata-cache)
+          (format-time-string "%Y-%m-%dT%H:%M:%SZ" (current-time)))
+    (whistle--save-metadata)))
+
+(defun whistle--delete-rule-metadata (rule-name)
+  "Delete metadata for RULE-NAME."
+  (unless whistle--metadata-cache
+    (whistle--load-metadata))
+  (let* ((server-name (whistle--server-rule-name rule-name))
+         (rules (alist-get 'rules whistle--metadata-cache)))
+    (setf (alist-get 'rules whistle--metadata-cache)
+          (assq-delete-all (intern server-name) rules))
+    (whistle--save-metadata)))
 
 ;;; File System Utilities
 
@@ -157,6 +291,8 @@ Each rule is saved as RULE-NAME.whistle in this directory."
   "Send POST request to PATH with DATA and call CALLBACK with response."
   (condition-case err
       (let ((url-request-method "POST")
+            (url-request-extra-headers
+             '(("Content-Type" . "application/x-www-form-urlencoded")))
             (url-request-data
              (mapconcat
               (lambda (kv)
@@ -282,37 +418,62 @@ Returns a plist with :rules and :values."
   (let* ((parsed (whistle--parse-buffer))
          (rules-content (plist-get parsed :rules))
          (values-alist (plist-get parsed :values))
+         (server-rule-name (whistle--server-rule-name whistle--current-rule-name))
          (sync-count 0)
-         (total-count (1+ (length values-alist))))
+         (total-count (1+ (length values-alist)))
+         (value-names nil))
 
-    (message "Syncing to whistle server...")
+    (message "Syncing to whistle server (as %s)..." server-rule-name)
 
-    ;; Sync rules
-    (whistle--http-post
-     "/cgi-bin/rules/update"
-     `(("name" . ,whistle--current-rule-name)
-       ("rules" . ,rules-content))
-     (lambda (_)
-       (setq sync-count (1+ sync-count))
-       (message "Synced rules (%d/%d)" sync-count total-count)
-       (when (= sync-count total-count)
-         (message "✓ Sync completed: 1 rule + %d values" (length values-alist))))
-     (lambda (err)
-       (message "Failed to sync rules: %s" err)))
+    ;; Transform value references in rules from {name} to {emacs:rule:name}
+    (let ((transformed-rules rules-content))
+      (dolist (value values-alist)
+        (let ((display-name (car value))
+              (server-name (whistle--server-value-name whistle--current-rule-name (car value))))
+          (setq transformed-rules
+                (replace-regexp-in-string
+                 (regexp-quote (format "{%s}" display-name))
+                 (format "{%s}" server-name)
+                 transformed-rules))
+          (push server-name value-names)))
 
-    ;; Sync each value
-    (dolist (value values-alist)
+      ;; Sync rule (always use /add, it updates if exists)
       (whistle--http-post
-       "/cgi-bin/values/update"
-       `(("name" . ,(car value))
-         ("value" . ,(cdr value)))
-       (lambda (_)
-         (setq sync-count (1+ sync-count))
-         (message "Synced value '%s' (%d/%d)" (car value) sync-count total-count)
-         (when (= sync-count total-count)
-           (message "✓ Sync completed: 1 rule + %d values" (length values-alist))))
-       (lambda (err)
-         (message "Failed to sync value '%s': %s" (car value) err))))))
+       "/cgi-bin/rules/add"
+       `(("name" . ,server-rule-name)
+         ("value" . ,transformed-rules))
+            (lambda (_)
+              (setq sync-count (1+ sync-count))
+              (message "Synced rules (%d/%d)" sync-count total-count)
+              (when (= sync-count total-count)
+                ;; Update metadata
+                (whistle--update-rule-metadata
+                 whistle--current-rule-name
+                 `((displayName . ,whistle--current-rule-name)
+                   (localFile . ,whistle--file-path)
+                   (fileHash . ,(whistle--calculate-hash (buffer-string)))
+                   (serverHash . ,(whistle--calculate-hash (buffer-string)))
+                   (values . ,(vconcat value-names))
+                   (modified . ,(format-time-string "%Y-%m-%dT%H:%M:%SZ" (current-time)))))
+                (message "✓ Sync completed: rule %s + %d values" server-rule-name (length values-alist))))
+            (lambda (err)
+              (message "Failed to sync rules: %s" err)))
+
+
+      ;; Sync values (always use /add, it updates if exists)
+      (dolist (value values-alist)
+        (let ((server-name (whistle--server-value-name whistle--current-rule-name (car value))))
+          (whistle--http-post
+           "/cgi-bin/values/add"
+           `(("name" . ,server-name)
+             ("value" . ,(cdr value)))
+           (lambda (_)
+             (setq sync-count (1+ sync-count))
+             (message "Synced value '%s' (%d/%d)" server-name sync-count total-count)
+             (when (= sync-count total-count)
+               (message "✓ Sync completed: rule %s + %d values" server-rule-name (length values-alist))))
+           (lambda (err)
+             (message "Failed to sync value '%s': %s" server-name err))))))))
 
 (defun whistle-load-from-server (&optional rule-name)
   "Load rules and values from whistle server.
@@ -464,8 +625,20 @@ If RULE-NAME is nil, prompt for it."
   (setq-local comment-start-skip "#+\\s-*")
   (setq-local font-lock-defaults '(whistle-font-lock-keywords))
   (whistle-setup-completion)
-  (when (boundp 'whistle-default-rule-name)
-    (setq whistle--current-rule-name whistle-default-rule-name))
+
+  ;; Auto-detect rule name from file name if visiting a .whistle file
+  (when (and buffer-file-name
+             (string-match "/\\([^/]+\\)\\.whistle\\'" buffer-file-name))
+    (let ((rule-name (match-string 1 buffer-file-name)))
+      (setq whistle--current-rule-name rule-name)
+      (setq whistle--file-path buffer-file-name)
+      (message "Editing rule: %s (will sync as emacs:%s)" rule-name rule-name)))
+
+  ;; Fallback to default rule name
+  (unless whistle--current-rule-name
+    (when (boundp 'whistle-default-rule-name)
+      (setq whistle--current-rule-name whistle-default-rule-name)))
+
   (font-lock-ensure))
 
 ;; Evil mode support for edit mode
@@ -560,6 +733,9 @@ Tries to load from local file first, then from server if not found locally."
     (define-key map (kbd "r") #'whistle-list-rename)
     (define-key map (kbd "t") #'whistle-list-toggle)
     (define-key map (kbd "SPC") #'whistle-list-toggle)
+    (define-key map (kbd "m") #'whistle-list-managed-rules)
+    (define-key map (kbd "C") #'whistle-cleanup-orphaned-values)
+    (define-key map (kbd "D") #'whistle-delete-all-managed-rules)
     (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for `whistle-list-mode'.")
@@ -586,6 +762,9 @@ Tries to load from local file first, then from server if not found locally."
     "r" #'whistle-list-rename
     "t" #'whistle-list-toggle
     (kbd "SPC") #'whistle-list-toggle
+    "m" #'whistle-list-managed-rules
+    "C" #'whistle-cleanup-orphaned-values
+    "D" #'whistle-delete-all-managed-rules
     "q" #'quit-window))
 
 (defun whistle-list-refresh ()
@@ -625,36 +804,12 @@ Tries to load from local file first, then from server if not found locally."
     (whistle-edit-rule name)))
 
 (defun whistle-list-create (name)
-  "Create a new rule with NAME."
+  "Create a new rule with NAME (will be prefixed with emacs:)."
   (interactive "sNew rule name: ")
   (when (string-empty-p name)
     (user-error "Rule name cannot be empty"))
-  (message "Creating rule: %s..." name)
-  (whistle--http-post
-   "/cgi-bin/rules/add"
-   `(("name" . ,name)
-     ("value" . ""))
-   (lambda (_response)
-     (message "Rule created: %s" name)
-     ;; First refresh the list
-     (whistle--http-get "/cgi-bin/rules/list"
-                        (lambda (data)
-                          (setq whistle-list--rules-data (alist-get 'list data))
-                          (whistle-list--update-display)
-                          ;; Then open the editor with empty content
-                          (let ((buffer (get-buffer-create (format "*Whistle: %s*" name))))
-                            (with-current-buffer buffer
-                              (whistle-mode)
-                              (setq whistle--current-rule-name name)
-                              (erase-buffer)
-                              (insert (format "# Whistle Rule: %s\n\n" name))
-                              (goto-char (point-max))
-                              (set-buffer-modified-p nil))
-                            (switch-to-buffer buffer)))
-                        (lambda (err)
-                          (message "Failed to refresh after create: %s" err))))
-   (lambda (err)
-     (message "Failed to create rule: %s" err))))
+  ;; Use whistle-edit-rule which handles V3 naming properly
+  (whistle-edit-rule name))
 
 (defun whistle-list-delete ()
   "Delete the selected rule."
@@ -712,6 +867,196 @@ Tries to load from local file first, then from server if not found locally."
      (lambda (err)
        (message "Failed to rename rule: %s" err)))))
 
+;;; Utility Functions
+
+(defun whistle-open-web-ui ()
+  "Open whistle web UI in browser."
+  (interactive)
+  (browse-url (whistle--get-base-url)))
+
+;;; Cleanup Utilities
+
+(defun whistle-list-managed-rules ()
+  "List all Emacs-managed rules with their sync status."
+  (interactive)
+  (whistle--http-get
+   "/cgi-bin/rules/list"
+   nil
+   (lambda (data)
+     (let* ((rules (cdr (assoc 'list data)))
+            (managed-rules (seq-filter
+                           (lambda (rule)
+                             (whistle--is-emacs-managed-p (cdr (assoc 'name rule))))
+                           rules))
+            (buf (get-buffer-create "*Whistle Managed Rules*")))
+       (with-current-buffer buf
+         (let ((inhibit-read-only t))
+           (erase-buffer)
+           (insert "Emacs-Managed Whistle Rules\n")
+           (insert "===========================\n\n")
+           (if (null managed-rules)
+               (insert "No Emacs-managed rules found.\n")
+             (dolist (rule managed-rules)
+               (let* ((server-name (cdr (assoc 'name rule)))
+                      (display-name (whistle--display-rule-name server-name))
+                      (metadata (whistle--get-rule-metadata display-name))
+                      (status (if metadata
+                                 (let ((file-hash (alist-get 'fileHash metadata))
+                                       (local-file (alist-get 'localFile metadata)))
+                                   (cond
+                                    ((not (file-exists-p local-file)) "⚠️  no local file")
+                                    ((not file-hash) "📝 not synced")
+                                    (t "✓ synced")))
+                               "❓ no metadata")))
+                 (insert (format "  %-30s %s\n" display-name status)))))
+           (insert (format "\nTotal: %d Emacs-managed rules\n"
+                          (length managed-rules)))
+           (goto-char (point-min))
+           (view-mode 1)))
+       (display-buffer buf)))
+   (lambda (err)
+     (message "Failed to list managed rules: %s" err))))
+
+(defun whistle-cleanup-orphaned-values ()
+  "Find and optionally delete values that belong to non-existent rules."
+  (interactive)
+  (whistle--http-get
+   "/cgi-bin/values/list"
+   nil
+   (lambda (values-data)
+     (whistle--http-get
+      "/cgi-bin/rules/list"
+      nil
+      (lambda (rules-data)
+        (let* ((all-values (cdr (assoc 'list values-data)))
+               (all-rules (cdr (assoc 'list rules-data)))
+               (rule-names (mapcar (lambda (r) (cdr (assoc 'name r))) all-rules))
+               (orphaned-values
+                (seq-filter
+                 (lambda (value)
+                   (let ((value-name (cdr (assoc 'name value))))
+                     ;; Check if it's an emacs-managed value
+                     (when (string-match (format "^%s:\\([^:]+\\):" whistle-rule-prefix)
+                                       value-name)
+                       (let ((rule-name (match-string 0 value-name)))
+                         ;; Remove trailing colon
+                         (setq rule-name (substring rule-name 0 -1))
+                         ;; Check if the rule doesn't exist
+                         (not (member rule-name rule-names))))))
+                 all-values)))
+          (if (null orphaned-values)
+              (message "No orphaned values found.")
+            (let ((buf (get-buffer-create "*Whistle Orphaned Values*")))
+              (with-current-buffer buf
+                (let ((inhibit-read-only t))
+                  (erase-buffer)
+                  (insert "Orphaned Emacs-Managed Values\n")
+                  (insert "==============================\n\n")
+                  (insert (format "Found %d orphaned values:\n\n" (length orphaned-values)))
+                  (dolist (value orphaned-values)
+                    (insert (format "  - %s\n" (cdr (assoc 'name value)))))
+                  (insert "\nThese values belong to deleted rules.\n")
+                  (insert "Press 'd' to delete all orphaned values, 'q' to quit.\n")
+                  (goto-char (point-min))
+                  (local-set-key (kbd "d")
+                               (lambda ()
+                                 (interactive)
+                                 (when (yes-or-no-p
+                                       (format "Delete %d orphaned values? "
+                                              (length orphaned-values)))
+                                   (whistle--delete-values-batch orphaned-values))))
+                  (local-set-key (kbd "q") 'quit-window)
+                  (view-mode 1)))
+              (display-buffer buf)))))
+      (lambda (err)
+        (message "Failed to fetch rules: %s" err))))
+   (lambda (err)
+     (message "Failed to fetch values: %s" err))))
+
+(defun whistle--delete-values-batch (values)
+  "Delete a batch of VALUES."
+  (let ((total (length values))
+        (deleted 0)
+        (failed 0))
+    (dolist (value values)
+      (let ((value-name (cdr (assoc 'name value))))
+        (whistle--http-post
+         "/cgi-bin/values/remove"
+         `(("name" . ,value-name))
+         (lambda (_)
+           (setq deleted (1+ deleted))
+           (message "Deleted %d/%d values..." deleted total)
+           (when (= deleted (- total failed))
+             (message "Cleanup complete: %d deleted, %d failed" deleted failed)))
+         (lambda (err)
+           (setq failed (1+ failed))
+           (message "Failed to delete %s: %s" value-name err)))))))
+
+(defun whistle-delete-all-managed-rules ()
+  "Delete all Emacs-managed rules and their associated values.
+This will remove all rules with the configured prefix from the server."
+  (interactive)
+  (when (yes-or-no-p
+         (format "Delete ALL Emacs-managed rules (prefix: %s:)? This cannot be undone! "
+                whistle-rule-prefix))
+    (whistle--http-get
+     "/cgi-bin/rules/list"
+     nil
+     (lambda (data)
+       (let* ((rules (cdr (assoc 'list data)))
+              (managed-rules (seq-filter
+                            (lambda (rule)
+                              (whistle--is-emacs-managed-p (cdr (assoc 'name rule))))
+                            rules)))
+         (if (null managed-rules)
+             (message "No Emacs-managed rules found.")
+           (when (yes-or-no-p
+                  (format "Found %d Emacs-managed rules. Confirm deletion? "
+                         (length managed-rules)))
+             (whistle--delete-rules-batch managed-rules)))))
+     (lambda (err)
+       (message "Failed to list rules: %s" err)))))
+
+(defun whistle--delete-rules-batch (rules)
+  "Delete a batch of RULES and their associated values."
+  (let ((total (length rules))
+        (deleted 0)
+        (failed 0))
+    (dolist (rule rules)
+      (let ((rule-name (cdr (assoc 'name rule))))
+        (whistle--http-post
+         "/cgi-bin/rules/remove"
+         `(("name" . ,rule-name))
+         (lambda (_)
+           (setq deleted (1+ deleted))
+           (message "Deleted %d/%d rules..." deleted total)
+           ;; Delete associated values
+           (let ((display-name (whistle--display-rule-name rule-name)))
+             (whistle--delete-rule-values display-name))
+           (when (= deleted (- total failed))
+             (message "Cleanup complete: %d rules deleted, %d failed" deleted failed)
+             (when (get-buffer "*Whistle Rules*")
+               (with-current-buffer "*Whistle Rules*"
+                 (whistle-list-refresh)))))
+         (lambda (err)
+           (setq failed (1+ failed))
+           (message "Failed to delete %s: %s" rule-name err)))))))
+
+(defun whistle--delete-rule-values (display-name)
+  "Delete all values associated with rule DISPLAY-NAME."
+  (let ((metadata (whistle--get-rule-metadata display-name)))
+    (when metadata
+      (let ((values (alist-get 'values metadata)))
+        (when values
+          (dolist (value-name values)
+            (whistle--http-post
+             "/cgi-bin/values/remove"
+             `(("name" . ,value-name))
+             (lambda (_)
+               (message "Deleted value: %s" value-name))
+             (lambda (err)
+               (message "Failed to delete value %s: %s" value-name err)))))))))
+
 ;;;###autoload
 (defun whistle ()
   "Open whistle rules list."
@@ -722,6 +1067,9 @@ Tries to load from local file first, then from server if not found locally."
       (whistle-list-refresh))
     (switch-to-buffer buf)))
 
-(provide 'whistle-v2)
+;;;###autoload
+(add-to-list 'auto-mode-alist '("\\.whistle\\'" . whistle-mode))
 
-;;; whistle-v2.el ends here
+(provide 'whistle-v3)
+
+;;; whistle-v3.el ends here
