@@ -549,10 +549,63 @@ If RULE-NAME is nil, prompt for it."
     "enable" "disable" "filter" "ignore" "pipe" "mark" "exports")
   "List of whistle protocol operators.")
 
+;; Use markdown-mode or org-mode style code block fontification
+(defun whistle--fontify-code-block (limit)
+  "Fontify code blocks with embedded json-mode highlighting."
+  (when (re-search-forward "^```\\([a-zA-Z0-9._-]*\\)$" limit t)
+    (let ((lang-start (match-beginning 1))
+          (lang-end (match-end 1))
+          (block-start (match-end 0)))
+      ;; Highlight the opening fence and language name
+      (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-comment-delimiter-face)
+      (when (< lang-start lang-end)
+        (put-text-property lang-start lang-end 'face 'font-lock-function-name-face))
+
+      (when (re-search-forward "^```$" limit t)
+        (let ((block-end (match-beginning 0)))
+          ;; Mark the entire block as multiline
+          (put-text-property block-start block-end 'font-lock-multiline t)
+          ;; Highlight closing fence
+          (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-comment-delimiter-face)
+
+          ;; Apply JSON highlighting to content
+          (save-excursion
+            (goto-char block-start)
+            ;; Skip newline after opening fence
+            (forward-line 1)
+            (let ((content-start (point)))
+              ;; JSON strings - check if it's a key or value
+              (while (re-search-forward "\"\\([^\"\\\\]\\|\\\\.\\)*\"" block-end t)
+                (let ((str-start (match-beginning 0))
+                      (str-end (match-end 0)))
+                  (save-excursion
+                    (goto-char str-end)
+                    (skip-chars-forward " \t")
+                    (if (looking-at ":")
+                        ;; JSON key
+                        (put-text-property str-start str-end 'face 'font-lock-keyword-face)
+                      ;; JSON string value
+                      (put-text-property str-start str-end 'face 'font-lock-string-face)))))
+
+              ;; JSON numbers
+              (goto-char content-start)
+              (while (re-search-forward "\\b-?[0-9]+\\(\\.[0-9]+\\)?\\([eE][+-]?[0-9]+\\)?\\b" block-end t)
+                (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-constant-face))
+
+              ;; JSON booleans and null
+              (goto-char content-start)
+              (while (re-search-forward "\\b\\(true\\|false\\|null\\)\\b" block-end t)
+                (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-constant-face))
+
+              ;; JSON punctuation
+              (goto-char content-start)
+              (while (re-search-forward "[{}\\[\\]:,]" block-end t)
+                (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-builtin-face)))))
+        t))))
+
 (defconst whistle-font-lock-keywords
-  `(;; Value blocks
-    ("^```\\([a-zA-Z0-9._-]+\\)$" 1 font-lock-function-name-face)
-    ("^```$" . font-lock-comment-delimiter-face)
+  `(;; Embedded JSON in code blocks - must come first
+    (whistle--fontify-code-block)
     ;; Comments
     ("^\\s-*#.*$" . font-lock-comment-face)
     ;; Protocol operators
@@ -623,7 +676,8 @@ If RULE-NAME is nil, prompt for it."
 \\{whistle-mode-map}"
   (setq-local comment-start "#")
   (setq-local comment-start-skip "#+\\s-*")
-  (setq-local font-lock-defaults '(whistle-font-lock-keywords))
+  (setq-local font-lock-defaults '(whistle-font-lock-keywords t))
+  (setq-local font-lock-multiline t)
   (whistle-setup-completion)
 
   ;; Auto-detect rule name from file name if visiting a .whistle file
