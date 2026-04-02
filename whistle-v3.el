@@ -111,35 +111,39 @@ Possible values:
 
 ;;; Naming Utilities
 
+(defun whistle--group-name ()
+  "Get the Whistle group name for Emacs-managed rules.
+Returns the group name with the required \\r prefix."
+  (concat "\r" whistle-rule-prefix))
+
 (defun whistle--server-rule-name (display-name)
-  "Convert display name to server name with prefix.
-Example: my-rule → emacs:my-rule"
-  (if (string-prefix-p (concat whistle-rule-prefix ":") display-name)
-      display-name  ; Already has prefix
-    (concat whistle-rule-prefix ":" display-name)))
+  "Convert display name to server name (just the rule name, no prefix).
+Example: my-rule → my-rule (group is specified separately)"
+  display-name)
 
 (defun whistle--display-rule-name (server-name)
-  "Convert server name to display name (remove prefix).
-Example: emacs:my-rule → my-rule"
-  (if (string-prefix-p (concat whistle-rule-prefix ":") server-name)
-      (substring server-name (+ 1 (length whistle-rule-prefix)))
-    server-name))
+  "Convert server name to display name.
+Since rules are now in a group, just return the name as-is."
+  server-name)
 
 (defun whistle--server-value-name (rule-name value-name)
-  "Get server value name with full namespace.
-Example: (my-rule, user-data) → emacs:my-rule:user-data"
-  (format "%s:%s:%s" whistle-rule-prefix rule-name value-name))
+  "Get server value name with rule namespace.
+Example: (my-rule, user-data) → emacs-my-rule-user-data"
+  (format "%s-%s-%s" whistle-rule-prefix rule-name value-name))
 
 (defun whistle--display-value-name (server-value-name)
   "Extract display value name from server name.
-Example: emacs:my-rule:user-data → user-data"
-  (if (string-match (format "^%s:[^:]+:\\(.+\\)$" whistle-rule-prefix) server-value-name)
+Example: emacs-my-rule-user-data → user-data"
+  (if (string-match (format "^%s-[^-]+-\\(.+\\)$" (regexp-quote whistle-rule-prefix))
+                    server-value-name)
       (match-string 1 server-value-name)
     server-value-name))
 
 (defun whistle--is-emacs-managed-p (name)
-  "Check if NAME is managed by Emacs (has prefix)."
-  (string-prefix-p (concat whistle-rule-prefix ":") name))
+  "Check if NAME is managed by Emacs.
+For rules, this is handled by group membership.
+For values, check the prefix."
+  (string-prefix-p (concat whistle-rule-prefix "-") name))
 
 ;;; Hash Utilities
 
@@ -425,7 +429,7 @@ Returns a plist with :rules and :values."
 
     (message "Syncing to whistle server (as %s)..." server-rule-name)
 
-    ;; Transform value references in rules from {name} to {emacs:rule:name}
+    ;; Transform value references in rules from {name} to {emacs-rule-name}
     (let ((transformed-rules rules-content))
       (dolist (value values-alist)
         (let ((display-name (car value))
@@ -437,11 +441,19 @@ Returns a plist with :rules and :values."
                  transformed-rules))
           (push server-name value-names)))
 
-      ;; Sync rule (always use /add, it updates if exists)
-      (whistle--http-post
-       "/cgi-bin/rules/add"
-       `(("name" . ,server-rule-name)
-         ("value" . ,transformed-rules))
+      ;; Ensure group exists first, then sync rule
+      (let ((group-name (whistle--group-name)))
+        ;; Create/ensure group exists
+        (whistle--http-post
+         "/cgi-bin/rules/add"
+         `(("name" . ,group-name))
+         (lambda (_)
+           ;; Group created/exists, now add rule to group
+           (whistle--http-post
+            "/cgi-bin/rules/add"
+            `(("name" . ,server-rule-name)
+              ("value" . ,transformed-rules)
+              ("groupName" . ,group-name))
             (lambda (_)
               (setq sync-count (1+ sync-count))
               (message "Synced rules (%d/%d)" sync-count total-count)
@@ -455,25 +467,41 @@ Returns a plist with :rules and :values."
                    (serverHash . ,(whistle--calculate-hash (buffer-string)))
                    (values . ,(vconcat value-names))
                    (modified . ,(format-time-string "%Y-%m-%dT%H:%M:%SZ" (current-time)))))
-                (message "✓ Sync completed: rule %s + %d values" server-rule-name (length values-alist))))
+                (message "✓ Sync completed: rule %s in group %s + %d values"
+                        server-rule-name whistle-rule-prefix (length values-alist))))
             (lambda (err)
-              (message "Failed to sync rules: %s" err)))
+              (message "Failed to sync rules: %s" err))))
+         (lambda (err)
+           ;; Group creation failed, but continue anyway
+           (message "Group setup warning: %s" err))))
 
 
-      ;; Sync values (always use /add, it updates if exists)
-      (dolist (value values-alist)
-        (let ((server-name (whistle--server-value-name whistle--current-rule-name (car value))))
-          (whistle--http-post
-           "/cgi-bin/values/add"
-           `(("name" . ,server-name)
-             ("value" . ,(cdr value)))
-           (lambda (_)
-             (setq sync-count (1+ sync-count))
-             (message "Synced value '%s' (%d/%d)" server-name sync-count total-count)
-             (when (= sync-count total-count)
-               (message "✓ Sync completed: rule %s + %d values" server-rule-name (length values-alist))))
-           (lambda (err)
-             (message "Failed to sync value '%s': %s" server-name err))))))))
+      ;; Sync values to the same group (always use /add, it updates if exists)
+      (let ((group-name (whistle--group-name)))
+        ;; Create/ensure value group exists first
+        (whistle--http-post
+         "/cgi-bin/values/add"
+         `(("name" . ,group-name))
+         (lambda (_)
+           ;; Group created/exists, now add values to group
+           (dolist (value values-alist)
+             (let ((server-name (whistle--server-value-name whistle--current-rule-name (car value))))
+               (whistle--http-post
+                "/cgi-bin/values/add"
+                `(("name" . ,server-name)
+                  ("value" . ,(cdr value))
+                  ("groupName" . ,group-name))
+                (lambda (_)
+                  (setq sync-count (1+ sync-count))
+                  (message "Synced value '%s' (%d/%d)" server-name sync-count total-count)
+                  (when (= sync-count total-count)
+                    (message "✓ Sync completed: rule %s in group %s + %d values"
+                            server-rule-name whistle-rule-prefix (length values-alist))))
+                (lambda (err)
+                  (message "Failed to sync value '%s': %s" server-name err))))))
+         (lambda (err)
+           ;; Value group creation failed, but continue anyway
+           (message "Value group setup warning: %s" err)))))))
 
 (defun whistle-load-from-server (&optional rule-name)
   "Load rules and values from whistle server.
