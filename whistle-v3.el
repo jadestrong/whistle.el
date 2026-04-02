@@ -419,10 +419,11 @@ Returns a plist with :rules and :values."
   (unless whistle--current-rule-name
     (user-error "No rule name set. Use whistle-set-rule-name first"))
 
-  (let* ((parsed (whistle--parse-buffer))
+  (let* ((current-rule-name whistle--current-rule-name)  ; Capture buffer-local value
+         (parsed (whistle--parse-buffer))
          (rules-content (plist-get parsed :rules))
          (values-alist (plist-get parsed :values))
-         (server-rule-name (whistle--server-rule-name whistle--current-rule-name))
+         (server-rule-name (whistle--server-rule-name current-rule-name))
          (sync-count 0)
          (total-count (1+ (length values-alist)))
          (value-names nil))
@@ -433,7 +434,7 @@ Returns a plist with :rules and :values."
     (let ((transformed-rules rules-content))
       (dolist (value values-alist)
         (let ((display-name (car value))
-              (server-name (whistle--server-value-name whistle--current-rule-name (car value))))
+              (server-name (whistle--server-value-name current-rule-name (car value))))
           (setq transformed-rules
                 (replace-regexp-in-string
                  (regexp-quote (format "{%s}" display-name))
@@ -460,8 +461,8 @@ Returns a plist with :rules and :values."
               (when (= sync-count total-count)
                 ;; Update metadata
                 (whistle--update-rule-metadata
-                 whistle--current-rule-name
-                 `((displayName . ,whistle--current-rule-name)
+                 current-rule-name
+                 `((displayName . ,current-rule-name)
                    (localFile . ,whistle--file-path)
                    (fileHash . ,(whistle--calculate-hash (buffer-string)))
                    (serverHash . ,(whistle--calculate-hash (buffer-string)))
@@ -478,30 +479,62 @@ Returns a plist with :rules and :values."
 
       ;; Sync values to the same group (always use /add, it updates if exists)
       (let ((group-name (whistle--group-name)))
-        ;; Create/ensure value group exists first
-        (whistle--http-post
-         "/cgi-bin/values/add"
-         `(("name" . ,group-name))
-         (lambda (_)
-           ;; Group created/exists, now add values to group
-           (dolist (value values-alist)
-             (let ((server-name (whistle--server-value-name whistle--current-rule-name (car value))))
+        ;; First, get list of existing values to clean up orphaned ones
+        (whistle--http-get
+         "/cgi-bin/values/list"
+         (lambda (values-data)
+           (let* ((all-server-values (mapcar (lambda (v) (cdr (assoc 'name v)))
+                                             (cdr (assoc 'list values-data))))
+                  ;; Build expected value prefix for this rule
+                  (value-prefix (format "%s-%s-" whistle-rule-prefix current-rule-name))
+                  ;; Find all values belonging to this rule on server
+                  (rule-server-values (cl-remove-if-not
+                                      (lambda (name) (string-prefix-p value-prefix name))
+                                      all-server-values))
+                  ;; Build list of current local value names
+                  (local-value-names (mapcar (lambda (v)
+                                              (whistle--server-value-name current-rule-name (car v)))
+                                            values-alist))
+                  ;; Find orphaned values (on server but not in local file)
+                  (orphaned-values (cl-remove-if (lambda (name) (member name local-value-names))
+                                                 rule-server-values)))
+
+             ;; Delete orphaned values
+             (dolist (orphaned-name orphaned-values)
                (whistle--http-post
-                "/cgi-bin/values/add"
-                `(("name" . ,server-name)
-                  ("value" . ,(cdr value))
-                  ("groupName" . ,group-name))
+                "/cgi-bin/values/remove"
+                `(("name" . ,orphaned-name))
                 (lambda (_)
-                  (setq sync-count (1+ sync-count))
-                  (message "Synced value '%s' (%d/%d)" server-name sync-count total-count)
-                  (when (= sync-count total-count)
-                    (message "✓ Sync completed: rule %s in group %s + %d values"
-                            server-rule-name whistle-rule-prefix (length values-alist))))
+                  (message "Deleted orphaned value: %s" orphaned-name))
                 (lambda (err)
-                  (message "Failed to sync value '%s': %s" server-name err))))))
+                  (message "Failed to delete orphaned value '%s': %s" orphaned-name err))))
+
+             ;; Create/ensure value group exists first
+             (whistle--http-post
+              "/cgi-bin/values/add"
+              `(("name" . ,group-name))
+              (lambda (_)
+                ;; Group created/exists, now add values to group
+                (dolist (value values-alist)
+                  (let ((server-name (whistle--server-value-name current-rule-name (car value))))
+                    (whistle--http-post
+                     "/cgi-bin/values/add"
+                     `(("name" . ,server-name)
+                       ("value" . ,(cdr value))
+                       ("groupName" . ,group-name))
+                     (lambda (_)
+                       (setq sync-count (1+ sync-count))
+                       (message "Synced value '%s' (%d/%d)" server-name sync-count total-count)
+                       (when (= sync-count total-count)
+                         (message "✓ Sync completed: rule %s in group %s + %d values"
+                                 server-rule-name whistle-rule-prefix (length values-alist))))
+                     (lambda (err)
+                       (message "Failed to sync value '%s': %s" server-name err))))))
+              (lambda (err)
+                ;; Value group creation failed, but continue anyway
+                (message "Value group setup warning: %s" err)))))
          (lambda (err)
-           ;; Value group creation failed, but continue anyway
-           (message "Value group setup warning: %s" err)))))))
+           (message "Failed to get values list for cleanup: %s" err)))))))
 
 (defun whistle-load-from-server (&optional rule-name)
   "Load rules and values from whistle server.
@@ -712,14 +745,14 @@ If RULE-NAME is nil, prompt for it."
   (when (and buffer-file-name
              (string-match "/\\([^/]+\\)\\.whistle\\'" buffer-file-name))
     (let ((rule-name (match-string 1 buffer-file-name)))
-      (setq whistle--current-rule-name rule-name)
-      (setq whistle--file-path buffer-file-name)
-      (message "Editing rule: %s (will sync as emacs:%s)" rule-name rule-name)))
+      (setq-local whistle--current-rule-name rule-name)
+      (setq-local whistle--file-path buffer-file-name)
+      (message "Editing rule: %s (will sync to group %s)" rule-name whistle-rule-prefix)))
 
   ;; Fallback to default rule name
   (unless whistle--current-rule-name
     (when (boundp 'whistle-default-rule-name)
-      (setq whistle--current-rule-name whistle-default-rule-name)))
+      (setq-local whistle--current-rule-name whistle-default-rule-name)))
 
   (font-lock-ensure))
 
