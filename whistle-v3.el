@@ -4,7 +4,7 @@
 
 ;; Author: Your Name
 ;; Version: 3.0.0
-;; Package-Requires: ((emacs "26.1"))
+;; Package-Requires: ((emacs "26.1") (polymode "0.2.2") (json-mode "1.8.0"))
 ;; Keywords: tools, whistle, proxy, debugging
 
 ;;; Commentary:
@@ -610,64 +610,32 @@ If RULE-NAME is nil, prompt for it."
     "enable" "disable" "filter" "ignore" "pipe" "mark" "exports")
   "List of whistle protocol operators.")
 
-;; Use markdown-mode or org-mode style code block fontification
-(defun whistle--fontify-code-block (limit)
-  "Fontify code blocks with embedded json-mode highlighting."
-  (when (re-search-forward "^```\\([a-zA-Z0-9._-]*\\)$" limit t)
-    (let ((lang-start (match-beginning 1))
-          (lang-end (match-end 1))
-          (block-start (match-end 0)))
-      ;; Highlight the opening fence and language name
-      (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-comment-delimiter-face)
-      (when (< lang-start lang-end)
-        (put-text-property lang-start lang-end 'face 'font-lock-function-name-face))
+;;; Polymode Configuration for Code Blocks
 
-      (when (re-search-forward "^```$" limit t)
-        (let ((block-end (match-beginning 0)))
-          ;; Mark the entire block as multiline
-          (put-text-property block-start block-end 'font-lock-multiline t)
-          ;; Highlight closing fence
-          (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-comment-delimiter-face)
+(require 'polymode)
+(require 'json-mode)
 
-          ;; Apply JSON highlighting to content
-          (save-excursion
-            (goto-char block-start)
-            ;; Skip newline after opening fence
-            (forward-line 1)
-            (let ((content-start (point)))
-              ;; JSON strings - check if it's a key or value
-              (while (re-search-forward "\"\\([^\"\\\\]\\|\\\\.\\)*\"" block-end t)
-                (let ((str-start (match-beginning 0))
-                      (str-end (match-end 0)))
-                  (save-excursion
-                    (goto-char str-end)
-                    (skip-chars-forward " \t")
-                    (if (looking-at ":")
-                        ;; JSON key
-                        (put-text-property str-start str-end 'face 'font-lock-keyword-face)
-                      ;; JSON string value
-                      (put-text-property str-start str-end 'face 'font-lock-string-face)))))
+;; Define the host mode
+(define-hostmode poly-whistle-hostmode
+  :mode 'whistle-mode)
 
-              ;; JSON numbers
-              (goto-char content-start)
-              (while (re-search-forward "\\b-?[0-9]+\\(\\.[0-9]+\\)?\\([eE][+-]?[0-9]+\\)?\\b" block-end t)
-                (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-constant-face))
+;; Define the inner mode for JSON code blocks
+(define-innermode poly-whistle-json-innermode
+  :mode 'json-mode
+  :head-matcher "^```[a-zA-Z0-9._-]*$"
+  :tail-matcher "^```\\s-*$"
+  :head-mode 'host
+  :tail-mode 'host)
 
-              ;; JSON booleans and null
-              (goto-char content-start)
-              (while (re-search-forward "\\b\\(true\\|false\\|null\\)\\b" block-end t)
-                (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-constant-face))
+;; Define the polymode
+(define-polymode poly-whistle-mode
+  :hostmode 'poly-whistle-hostmode
+  :innermodes '(poly-whistle-json-innermode))
 
-              ;; JSON punctuation
-              (goto-char content-start)
-              (while (re-search-forward "[{}\\[\\]:,]" block-end t)
-                (put-text-property (match-beginning 0) (match-end 0) 'face 'font-lock-builtin-face)))))
-        t))))
+;;; Font Lock Keywords
 
 (defconst whistle-font-lock-keywords
-  `(;; Embedded JSON in code blocks - must come first
-    (whistle--fontify-code-block)
-    ;; Comments
+  `(;; Comments
     ("^\\s-*#.*$" . font-lock-comment-face)
     ;; Protocol operators
     (,(regexp-opt whistle-protocols 'symbols) . font-lock-keyword-face)
@@ -733,12 +701,13 @@ If RULE-NAME is nil, prompt for it."
 
 (define-derived-mode whistle-mode prog-mode "Whistle"
   "Major mode for editing whistle rules and values in unified format.
+Uses polymode for multi-mode support in code blocks.
 
 \\{whistle-mode-map}"
   (setq-local comment-start "#")
   (setq-local comment-start-skip "#+\\s-*")
   (setq-local font-lock-defaults '(whistle-font-lock-keywords t))
-  (setq-local font-lock-multiline t)
+
   (whistle-setup-completion)
 
   ;; Auto-detect rule name from file name if visiting a .whistle file
@@ -754,7 +723,8 @@ If RULE-NAME is nil, prompt for it."
     (when (boundp 'whistle-default-rule-name)
       (setq-local whistle--current-rule-name whistle-default-rule-name)))
 
-  (font-lock-ensure))
+  ;; Enable polymode for code blocks
+  (poly-whistle-mode))
 
 ;; Evil mode support for edit mode
 (with-eval-after-load 'evil
