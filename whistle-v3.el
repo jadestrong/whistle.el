@@ -686,9 +686,17 @@ If RULE-NAME is nil, prompt for it."
               ;; Complete value names
               (list start end (whistle--get-value-names)
                     :annotation-function (lambda (_) " <value>"))
-            ;; Complete protocols
-            (list start end whistle-protocols
-                  :annotation-function (lambda (_) " <protocol>"))))))))
+            ;; Complete protocols with :// suffix
+            (list start end
+                  ;; 使用 completion-table-case-fold 实现大小写不敏感
+                  (completion-table-case-fold whistle-protocols)
+                  :annotation-function (lambda (_) " <protocol>")
+                  :exit-function
+                  (lambda (candidate status)
+                    (when (eq status 'finished)
+                      ;; 检查后面是否已经有 ://
+                      (unless (looking-at "://")
+                        (insert "://")))))))))))
 
 (defun whistle-setup-completion ()
   "Setup completion for whistle mode."
