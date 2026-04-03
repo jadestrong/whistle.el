@@ -632,6 +632,17 @@ If RULE-NAME is nil, prompt for it."
   :hostmode 'poly-whistle-hostmode
   :innermodes '(poly-whistle-json-innermode))
 
+;; Ensure whistle keybindings work in JSON innermode
+(defun poly-whistle-json-mode-setup ()
+  "Setup keybindings for JSON innermode to preserve whistle commands."
+  (when (and (boundp 'polymode-mode) polymode-mode)
+    ;; Add whistle keybindings to json-mode-map when in polymode
+    (local-set-key (kbd "C-c C-s") #'whistle-sync-to-server)
+    (local-set-key (kbd "C-c C-l") #'whistle-load-from-server)
+    (local-set-key (kbd "C-x C-s") #'whistle-save)))
+
+(add-hook 'json-mode-hook #'poly-whistle-json-mode-setup)
+
 ;;; Font Lock Keywords
 
 (defconst whistle-font-lock-keywords
@@ -1153,7 +1164,9 @@ This will remove all rules with the configured prefix from the server."
     (switch-to-buffer buf)))
 
 ;;;###autoload
-(add-to-list 'auto-mode-alist '("\\.whistle\\'" . whistle-mode))
+;; (add-to-list 'auto-mode-alist '("\\.whistle\\'" . whistle-mode))
+;; 注释掉以避免与 whistle-ts-mode 冲突
+;; 如果想使用 polymode 版本，取消注释上面这行
 
 (provide 'whistle-v3)
 
