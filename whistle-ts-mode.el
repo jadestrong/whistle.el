@@ -10,7 +10,7 @@
 ;;; Commentary:
 
 ;; Tree-sitter based major mode for editing Whistle rules with embedded JSON.
-;; Uses text mode as host and JSON tree-sitter for code blocks.
+;; Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
 
 ;;; Code:
 
@@ -22,7 +22,55 @@
   :type 'integer
   :group 'whistle)
 
-;; JSON 缩进规则（参考 json-ts-mode）
+;;; Whistle Font-lock 设置
+
+(defvar whistle-ts-mode--whistle-font-lock-settings
+  (when (treesit-ready-p 'whistle t)
+    (treesit-font-lock-rules
+     :language 'whistle
+     :feature 'comment
+     '((comment) @font-lock-comment-face)
+
+     :language 'whistle
+     :feature 'negation
+     '((negation) @font-lock-negation-char-face)
+
+     :language 'whistle
+     :feature 'pattern
+     '((regexp_pattern) @font-lock-regexp-face
+       (regexp_pattern_no_flag) @font-lock-regexp-face
+       (dollar_regexp) @font-lock-regexp-face
+       (url_pattern) @font-lock-string-face
+       (wildcard_pattern) @font-lock-property-name-face
+       (port_pattern) @font-lock-number-face
+       (ipv4_pattern) @font-lock-constant-face
+       (ipv6_pattern) @font-lock-constant-face
+       (ipv6_with_brackets) @font-lock-constant-face
+       (local_path_windows) @font-lock-string-face
+       (local_path_unix) @font-lock-property-name-face
+       (macro_pattern) @font-lock-variable-use-face
+       (at_reference) @font-lock-variable-use-face
+       (plugin_var) @font-lock-variable-use-face
+       (domain_pattern) @font-lock-string-face)
+
+     :language 'whistle
+     :feature 'operator
+     '((protocol_name) @font-lock-keyword-face
+       (plugin_full_name) @font-lock-function-call-face)
+
+     :language 'whistle
+     :feature 'value
+     '((operator_value) @font-lock-string-face
+       (simple_value) @font-lock-string-face)
+
+     :language 'whistle
+     :feature 'error
+     :override t
+     '((ERROR) @font-lock-warning-face)))
+  "Tree-sitter font-lock settings for Whistle rules.")
+
+;;; JSON 缩进规则（参考 json-ts-mode）
+
 (defvar whistle-ts-mode--indent-rules
   `((json
      ;; 闭合括号回到父级缩进
@@ -30,12 +78,16 @@
      ((node-is "]") parent-bol 0)
      ;; object/array 内部元素缩进
      ((parent-is "object") parent-bol ,whistle-ts-mode-indent-offset)
-     ((parent-is "array") parent-bol ,whistle-ts-mode-indent-offset)))
+     ((parent-is "array") parent-bol ,whistle-ts-mode-indent-offset))
+    (whistle
+     ;; whistle 规则不需要缩进
+     (no-node parent-bol 0)))
   "Tree-sitter indentation rules for `whistle-ts-mode'.")
 
-;; Font-lock 设置（使用 json-ts-mode 的高亮）
-(defvar whistle-ts-mode--font-lock-settings
-  (when (treesit-ready-p 'json)
+;;; JSON Font-lock 设置
+
+(defvar whistle-ts-mode--json-font-lock-settings
+  (when (treesit-ready-p 'json t)
     (treesit-font-lock-rules
      :language 'json
      :feature 'bracket
@@ -66,7 +118,7 @@
 
      :language 'json
      :feature 'pair
-     :override t ;; Needed for overriding string face on keys.
+     :override t
      '((pair key: (string) @font-lock-property-name-face))
 
      :language 'json
@@ -75,7 +127,8 @@
      '((ERROR) @font-lock-warning-face)))
   "Tree-sitter font-lock settings for JSON in whistle-ts-mode.")
 
-;; Range 规则：定义 JSON 代码块区域
+;;; Range 规则：定义 JSON 代码块区域
+
 (defun whistle-ts-mode--json-ranges ()
   "Return ranges for JSON code blocks in the buffer."
   (let ((ranges '()))
@@ -93,57 +146,101 @@
                   (push (cons content-start content-end) ranges))))))))
     (nreverse ranges)))
 
+(defun whistle-ts-mode--whistle-ranges ()
+  "Return ranges for Whistle rules (everything outside JSON code blocks)."
+  (let ((json-ranges (whistle-ts-mode--json-ranges))
+        (whistle-ranges '())
+        (pos 1))
+    (dolist (json-range json-ranges)
+      ;; 添加 JSON 块之前的区域（包括 ``` 标记行）
+      (when (< pos (car json-range))
+        (push (cons pos (car json-range)) whistle-ranges))
+      (setq pos (cdr json-range)))
+    ;; 添加最后一个 JSON 块之后的区域
+    (when (< pos (point-max))
+      (push (cons pos (point-max)) whistle-ranges))
+    (nreverse whistle-ranges)))
+
 (defun whistle-ts-mode--language-at-point (point)
   "Return the language at POINT."
-  (let ((ranges (whistle-ts-mode--json-ranges)))
+  (let ((json-ranges (whistle-ts-mode--json-ranges)))
     (if (cl-some (lambda (range)
                    (and (>= point (car range))
                         (<= point (cdr range))))
-                 ranges)
+                 json-ranges)
         'json
-      nil)))
+      'whistle)))
 
 ;;;###autoload
 (define-derived-mode whistle-ts-mode prog-mode "Whistle[TS]"
   "Major mode for editing Whistle rules with tree-sitter support.
-Uses JSON tree-sitter grammar for code blocks.
+Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
 
 \\{whistle-ts-mode-map}"
   :group 'whistle
-
-  ;; 检查 JSON grammar 是否可用
-  (unless (treesit-ready-p 'json)
-    (error "Tree-sitter grammar for JSON isn't available. Please install it with: M-x treesit-install-language-grammar RET json RET"))
 
   ;; 基本设置
   (setq-local comment-start "#")
   (setq-local comment-start-skip "#+\\s-*")
 
-  ;; 创建 JSON parser
-  (when (treesit-ready-p 'json)
-    (let ((parser (treesit-parser-create 'json)))
-      ;; 设置 JSON parser 只在代码块范围内工作
-      (treesit-parser-set-included-ranges
-       parser
-       (whistle-ts-mode--json-ranges)))
+  ;; 检查并创建 parsers
+  (let ((has-whistle (treesit-ready-p 'whistle t))
+        (has-json (treesit-ready-p 'json t))
+        (font-lock-settings nil)
+        (feature-list nil))
+
+    ;; 创建 whistle parser (主 parser)
+    (when has-whistle
+      (let ((whistle-parser (treesit-parser-create 'whistle)))
+        ;; whistle parser 解析整个文件（包括代码块标记）
+        ;; 但我们只对非 JSON 部分应用高亮
+        (treesit-parser-set-included-ranges
+         whistle-parser
+         (whistle-ts-mode--whistle-ranges)))
+      (setq font-lock-settings
+            (append font-lock-settings whistle-ts-mode--whistle-font-lock-settings))
+      (setq feature-list
+            (append feature-list '((comment negation) (pattern operator value) (error)))))
+
+    ;; 创建 JSON parser
+    (when has-json
+      (let ((json-parser (treesit-parser-create 'json)))
+        ;; 设置 JSON parser 只在代码块范围内工作
+        (treesit-parser-set-included-ranges
+         json-parser
+         (whistle-ts-mode--json-ranges)))
+      (setq font-lock-settings
+            (append font-lock-settings whistle-ts-mode--json-font-lock-settings))
+      ;; JSON features 合并到 feature list
+      (setq feature-list
+            (if feature-list
+                (cl-mapcar (lambda (a b) (append a b))
+                           feature-list
+                           '((string number constant) (bracket delimiter pair) (escape-sequence error)))
+              '((string number constant) (bracket delimiter pair) (escape-sequence error)))))
 
     ;; 设置缩进
     (setq-local treesit-simple-indent-rules whistle-ts-mode--indent-rules)
 
     ;; 设置 font-lock
-    (setq-local treesit-font-lock-settings whistle-ts-mode--font-lock-settings)
-    (setq-local treesit-font-lock-feature-list
-                '((string number constant)
-                  (bracket delimiter pair)))
+    (when font-lock-settings
+      (setq-local treesit-font-lock-settings font-lock-settings))
+    (when feature-list
+      (setq-local treesit-font-lock-feature-list feature-list))
 
     ;; 设置语言检测函数
     (setq-local treesit-language-at-point-function
                 #'whistle-ts-mode--language-at-point)
 
-    ;; 启用 tree-sitter
-    (treesit-major-mode-setup))
+    ;; 启用 tree-sitter (如果有任何一个 grammar 可用)
+    (when (or has-whistle has-json)
+      (treesit-major-mode-setup))
 
-  ;; 复用 whistle-v3 的功能
+    ;; 如果没有 tree-sitter 支持，回退到传统 font-lock
+    (unless (or has-whistle has-json)
+      (setq-local font-lock-defaults '(whistle-font-lock-keywords t))))
+
+  ;; 复用 whistle-core 的功能
   (whistle-setup-completion)
 
   ;; Auto-detect rule name from file name
@@ -159,18 +256,23 @@ Uses JSON tree-sitter grammar for code blocks.
     (when (boundp 'whistle-default-rule-name)
       (setq-local whistle--current-rule-name whistle-default-rule-name)))
 
-  ;; 添加 buffer 变化的 hook 来更新 JSON ranges
+  ;; 添加 buffer 变化的 hook 来更新 parser ranges
   (add-hook 'after-change-functions #'whistle-ts-mode--update-ranges nil t))
 
 (defun whistle-ts-mode--update-ranges (&rest _)
-  "Update JSON parser ranges after buffer changes."
-  (when (and (treesit-ready-p 'json)
-             (treesit-parser-list))
-    (let ((parser (car (treesit-parser-list))))
-      (when parser
-        (treesit-parser-set-included-ranges
-         parser
-         (whistle-ts-mode--json-ranges))))))
+  "Update parser ranges after buffer changes."
+  (when (treesit-parser-list)
+    (dolist (parser (treesit-parser-list))
+      (let ((lang (treesit-parser-language parser)))
+        (cond
+         ((eq lang 'json)
+          (treesit-parser-set-included-ranges
+           parser
+           (whistle-ts-mode--json-ranges)))
+         ((eq lang 'whistle)
+          (treesit-parser-set-included-ranges
+           parser
+           (whistle-ts-mode--whistle-ranges))))))))
 
 ;; Keymap (与 whistle-mode 保持一致)
 (defvar whistle-ts-mode-map
