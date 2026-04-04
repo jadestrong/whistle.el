@@ -60,8 +60,16 @@
 
      :language 'whistle
      :feature 'value
-     '((operator_value) @font-lock-string-face
+     '((value_text_start) @font-lock-string-face
+       (value_text) @font-lock-string-face
        (simple_value) @font-lock-string-face)
+
+     :language 'whistle
+     :feature 'reference
+     :override t
+     '((brace_open) @font-lock-bracket-face
+       (brace_close) @font-lock-bracket-face
+       (reference_name) @font-lock-variable-use-face)
 
      :language 'whistle
      :feature 'error
@@ -200,7 +208,7 @@ Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
       (setq font-lock-settings
             (append font-lock-settings whistle-ts-mode--whistle-font-lock-settings))
       (setq feature-list
-            (append feature-list '((comment negation) (pattern operator value) (error)))))
+            (append feature-list '((comment negation) (pattern operator value) (reference error)))))
 
     ;; 创建 JSON parser
     (when has-json
@@ -216,8 +224,8 @@ Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
             (if feature-list
                 (cl-mapcar (lambda (a b) (append a b))
                            feature-list
-                           '((string number constant) (bracket delimiter pair) (escape-sequence error)))
-              '((string number constant) (bracket delimiter pair) (escape-sequence error)))))
+                           '((string number constant) (bracket delimiter pair) (escape-sequence) (error)))
+              '((string number constant) (bracket delimiter pair) (escape-sequence) (error)))))
 
     ;; 设置缩进
     (setq-local treesit-simple-indent-rules whistle-ts-mode--indent-rules)
