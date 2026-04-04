@@ -15,19 +15,22 @@
 ;;; Code:
 
 (require 'treesit)
-(require 'whistle-v3)  ; 复用现有的函数和变量
+(require 'whistle-core)  ; 复用核心功能（不依赖 polymode）
 
 (defcustom whistle-ts-mode-indent-offset 2
   "Number of spaces for each indentation step in `whistle-ts-mode'."
   :type 'integer
   :group 'whistle)
 
-;; 简单的缩进规则（主要是 JSON 部分）
+;; JSON 缩进规则（参考 json-ts-mode）
 (defvar whistle-ts-mode--indent-rules
   `((json
+     ;; 闭合括号回到父级缩进
+     ((node-is "}") parent-bol 0)
+     ((node-is "]") parent-bol 0)
+     ;; object/array 内部元素缩进
      ((parent-is "object") parent-bol ,whistle-ts-mode-indent-offset)
-     ((parent-is "array") parent-bol ,whistle-ts-mode-indent-offset)
-     ((parent-is "pair") parent-bol ,whistle-ts-mode-indent-offset)))
+     ((parent-is "array") parent-bol ,whistle-ts-mode-indent-offset)))
   "Tree-sitter indentation rules for `whistle-ts-mode'.")
 
 ;; Font-lock 设置（使用 json-ts-mode 的高亮）
@@ -169,12 +172,16 @@ Uses JSON tree-sitter grammar for code blocks.
          parser
          (whistle-ts-mode--json-ranges))))))
 
-;; 复用 whistle-v3 的 keymap
+;; Keymap (与 whistle-mode 保持一致)
 (defvar whistle-ts-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'whistle-save)
     (define-key map (kbd "C-c C-s") #'whistle-sync-to-server)
     (define-key map (kbd "C-c C-l") #'whistle-load-from-server)
     (define-key map (kbd "C-c C-n") #'whistle-set-rule-name)
+    (define-key map (kbd "C-c C-a") #'whistle-activate-rule)
+    (define-key map (kbd "C-c C-v") #'whistle-insert-value-block)
+    (define-key map (kbd "C-c C-t") #'whistle-insert-template)
     (define-key map (kbd "C-x C-s") #'whistle-save)
     map)
   "Keymap for `whistle-ts-mode'.")
@@ -185,7 +192,18 @@ Uses JSON tree-sitter grammar for code blocks.
     (kbd ", ,") #'whistle-save
     (kbd ", s") #'whistle-sync-to-server
     (kbd ", l") #'whistle-load-from-server
-    (kbd ", n") #'whistle-set-rule-name))
+    (kbd ", n") #'whistle-set-rule-name
+    (kbd ", a") #'whistle-activate-rule
+    (kbd ", v") #'whistle-insert-value-block
+    (kbd ", t") #'whistle-insert-template)
+  (evil-define-key 'insert whistle-ts-mode-map
+    (kbd "C-c C-c") #'whistle-save
+    (kbd "C-c C-s") #'whistle-sync-to-server
+    (kbd "C-c C-l") #'whistle-load-from-server
+    (kbd "C-c C-n") #'whistle-set-rule-name
+    (kbd "C-c C-a") #'whistle-activate-rule
+    (kbd "C-c C-v") #'whistle-insert-value-block
+    (kbd "C-c C-t") #'whistle-insert-template))
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.whistle\\'" . whistle-ts-mode))
