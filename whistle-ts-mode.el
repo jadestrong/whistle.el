@@ -282,9 +282,23 @@ Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
            parser
            (whistle-ts-mode--whistle-ranges))))))))
 
+;;; Electric value block
+
+(defun whistle-ts-mode-electric-backtick ()
+  "Insert backtick, and expand to value block when typing ``` at line beginning."
+  (interactive)
+  (insert "`")
+  ;; 检查是否在行首输入了 ```
+  (when (looking-back "^```" (line-beginning-position))
+    (let ((name (read-string "Value name: " nil nil "value")))
+      (insert name "\n\n```")
+      (forward-line -1)
+      (end-of-line))))
+
 ;; Keymap (与 whistle-mode 保持一致)
 (defvar whistle-ts-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "`") #'whistle-ts-mode-electric-backtick)
     (define-key map (kbd "C-c C-c") #'whistle-save)
     (define-key map (kbd "C-c C-s") #'whistle-sync-to-server)
     (define-key map (kbd "C-c C-l") #'whistle-load-from-server)
@@ -307,6 +321,7 @@ Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
     (kbd ", v") #'whistle-insert-value-block
     (kbd ", t") #'whistle-insert-template)
   (evil-define-key 'insert whistle-ts-mode-map
+    (kbd "`") #'whistle-ts-mode-electric-backtick
     (kbd "C-c C-c") #'whistle-save
     (kbd "C-c C-s") #'whistle-sync-to-server
     (kbd "C-c C-l") #'whistle-load-from-server
