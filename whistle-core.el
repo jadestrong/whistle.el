@@ -648,11 +648,17 @@ If RULE-NAME is nil, prompt for it."
 (defun whistle-completion-at-point ()
   "Completion function for whistle protocols and value names."
   (let ((bounds (bounds-of-thing-at-point 'symbol)))
-    (when bounds
-      ;; Check if we're inside {  }
-      (save-excursion
-        (let ((start (car bounds))
-              (end (cdr bounds)))
+    (cond
+     ;; Case 1: 在 { 后面但没有 symbol（刚输入 {）
+     ((and (null bounds)
+           (> (point) (point-min))
+           (eq (char-before) ?{))
+      (list (point) (point) (whistle--get-value-names)
+            :annotation-function (lambda (_) " <value>")))
+     ;; Case 2: 有 symbol
+     (bounds
+      (let ((start (car bounds))
+            (end (cdr bounds)))
           (if (and (> start (point-min))
                    (eq (char-before start) ?{))
               ;; Complete value names
