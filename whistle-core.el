@@ -636,6 +636,17 @@ If RULE-NAME is nil, prompt for it."
 
 ;;; Auto-completion
 
+(defvar whistle--cached-server-values nil
+  "Cached list of value names from server (emacs group only).")
+
+(defvar whistle--server-values-cache-time nil
+  "Time when server values were last cached.")
+
+(defcustom whistle-completion-cache-ttl 60
+  "Time to live for server values cache in seconds."
+  :type 'integer
+  :group 'whistle)
+
 (defun whistle--get-value-names ()
   "Get all value names defined in current buffer."
   (save-excursion
@@ -645,6 +656,84 @@ If RULE-NAME is nil, prompt for it."
         (push (match-string-no-properties 1) names))
       (nreverse names))))
 
+(defun whistle--parse-server-value-name (server-value-name)
+  "Parse server value name to extract the display name.
+Example: emacs-my-rule-user-data → user-data
+
+Note: This assumes value names don't contain hyphens in rule names with hyphens.
+The parsing extracts everything after the last occurrence of 'prefix-' pattern."
+  (if (string-match (format "^%s-\\(.+\\)$" (regexp-quote whistle-rule-prefix))
+                    server-value-name)
+      ;; Got: "my-rule-user-data", now find the last segment after removing rule
+      ;; Since we can't reliably parse without knowing the rule name,
+      ;; we return the full name minus the prefix for now
+      (match-string 1 server-value-name)
+    nil))
+
+(defun whistle--get-server-value-display-name (server-value-name)
+  "Get display name for a server value, attempting to extract just the value part.
+For emacs-RULE-VALUE format, tries to extract VALUE.
+Falls back to full name minus prefix if parsing is ambiguous."
+  (let ((without-prefix (whistle--parse-server-value-name server-value-name)))
+    (if without-prefix
+        ;; Try to find if there's metadata for current rule
+        (if whistle--current-rule-name
+            ;; We know the current rule, so we can extract precisely
+            (let ((rule-prefix (concat whistle--current-rule-name "-")))
+              (if (string-prefix-p rule-prefix without-prefix)
+                  (substring without-prefix (length rule-prefix))
+                ;; Not for current rule, return as-is
+                without-prefix))
+          ;; No current rule context, return without main prefix
+          without-prefix)
+      server-value-name)))
+
+(defun whistle--get-server-values-async (callback)
+  "Asynchronously fetch all Emacs-managed values from server and call CALLBACK with results."
+  (whistle--http-get
+   "/cgi-bin/values/list"
+   (lambda (data)
+     (let* ((all-values (alist-get 'list data))
+            (emacs-values (seq-filter
+                          (lambda (v)
+                            (let ((name (alist-get 'name v)))
+                              (and name (whistle--is-emacs-managed-p name))))
+                          all-values))
+            (display-names (delq nil
+                                (mapcar (lambda (v)
+                                         (whistle--get-server-value-display-name
+                                          (alist-get 'name v)))
+                                       emacs-values))))
+       (funcall callback display-names)))
+   (lambda (err)
+     (message "Failed to fetch server values: %s" err)
+     (funcall callback nil))))
+
+(defun whistle--get-server-values-cached ()
+  "Get server values with caching.
+Returns cached values if available and not expired, otherwise returns local values only."
+  (let ((now (float-time)))
+    (if (and whistle--cached-server-values
+             whistle--server-values-cache-time
+             (< (- now whistle--server-values-cache-time) whistle-completion-cache-ttl))
+        ;; Return cached values
+        whistle--cached-server-values
+      ;; Cache expired or doesn't exist - trigger async refresh but return empty for now
+      (whistle--get-server-values-async
+       (lambda (values)
+         (when values
+           (setq whistle--cached-server-values values)
+           (setq whistle--server-values-cache-time (float-time)))))
+      ;; Return cached values if available, or empty list
+      (or whistle--cached-server-values '()))))
+
+(defun whistle--get-all-value-names ()
+  "Get all value names from both current buffer and server.
+Combines local value names with cached server values, removing duplicates."
+  (let ((local-names (whistle--get-value-names))
+        (server-names (whistle--get-server-values-cached)))
+    (delete-dups (append local-names server-names))))
+
 (defun whistle-completion-at-point ()
   "Completion function for whistle protocols and value names."
   (let ((bounds (bounds-of-thing-at-point 'symbol)))
@@ -653,24 +742,30 @@ If RULE-NAME is nil, prompt for it."
      ((and (null bounds)
            (> (point) (point-min))
            (eq (char-before) ?{))
-      (list (point) (point) (whistle--get-value-names)
-            :annotation-function (lambda (_) " <value>")))
+      (list (point) (point) (whistle--get-all-value-names)
+            :annotation-function (lambda (candidate)
+                                   (if (member candidate (whistle--get-value-names))
+                                       " <value:local>"
+                                     " <value:server>"))))
      ;; Case 2: 有 symbol
      (bounds
       (let ((start (car bounds))
             (end (cdr bounds)))
           (if (and (> start (point-min))
                    (eq (char-before start) ?{))
-              ;; Complete value names
-              (list start end (whistle--get-value-names)
-                    :annotation-function (lambda (_) " <value>"))
+              ;; Complete value names (both local and server)
+              (list start end (whistle--get-all-value-names)
+                    :annotation-function (lambda (candidate)
+                                           (if (member candidate (whistle--get-value-names))
+                                               " <value:local>"
+                                             " <value:server>")))
             ;; Complete protocols with :// suffix
             (list start end
                   ;; 使用 completion-table-case-fold 实现大小写不敏感
                   (completion-table-case-fold whistle-protocols)
                   :annotation-function (lambda (_) " <protocol>")
                   :exit-function
-                  (lambda (candidate status)
+                  (lambda (_candidate status)
                     (when (eq status 'finished)
                       ;; 检查后面是否已经有 ://
                       (unless (looking-at "://")
@@ -680,6 +775,19 @@ If RULE-NAME is nil, prompt for it."
   "Setup completion for whistle mode."
   (add-hook 'completion-at-point-functions
             #'whistle-completion-at-point nil t))
+
+(defun whistle-refresh-server-values-cache ()
+  "Manually refresh the server values cache for completion."
+  (interactive)
+  (message "Refreshing server values cache...")
+  (whistle--get-server-values-async
+   (lambda (values)
+     (if values
+         (progn
+           (setq whistle--cached-server-values values)
+           (setq whistle--server-values-cache-time (float-time))
+           (message "✓ Cached %d server values" (length values)))
+       (message "⚠️ Failed to refresh server values cache")))))
 
 ;;; Interactive Commands
 
