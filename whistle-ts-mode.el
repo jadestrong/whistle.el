@@ -306,6 +306,7 @@ Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
     (define-key map (kbd "C-c C-a") #'whistle-activate-rule)
     (define-key map (kbd "C-c C-v") #'whistle-insert-value-block)
     (define-key map (kbd "C-c C-t") #'whistle-insert-template)
+    (define-key map (kbd "C-c C-r") #'whistle-refresh-server-values-cache)
     (define-key map (kbd "C-x C-s") #'whistle-save)
     map)
   "Keymap for `whistle-ts-mode'.")
@@ -319,7 +320,8 @@ Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
     (kbd ", n") #'whistle-set-rule-name
     (kbd ", a") #'whistle-activate-rule
     (kbd ", v") #'whistle-insert-value-block
-    (kbd ", t") #'whistle-insert-template)
+    (kbd ", t") #'whistle-insert-template
+    (kbd ", r") #'whistle-refresh-server-values-cache)
   (evil-define-key 'insert whistle-ts-mode-map
     (kbd "`") #'whistle-ts-mode-electric-backtick
     (kbd "C-c C-c") #'whistle-save
@@ -328,7 +330,8 @@ Uses whistle tree-sitter for rules and JSON tree-sitter for code blocks.
     (kbd "C-c C-n") #'whistle-set-rule-name
     (kbd "C-c C-a") #'whistle-activate-rule
     (kbd "C-c C-v") #'whistle-insert-value-block
-    (kbd "C-c C-t") #'whistle-insert-template))
+    (kbd "C-c C-t") #'whistle-insert-template
+    (kbd "C-c C-r") #'whistle-refresh-server-values-cache))
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.whistle\\'" . whistle-ts-mode))

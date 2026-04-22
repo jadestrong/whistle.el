@@ -133,13 +133,13 @@ Since rules are now in a group, just return the name as-is."
 
 (defun whistle--server-value-name (rule-name value-name)
   "Get server value name with rule namespace.
-Example: (my-rule, user-data) → emacs-my-rule-user-data"
-  (format "%s-%s-%s" whistle-rule-prefix rule-name value-name))
+Example: (my-rule, user-data) → emacs::my-rule::user-data"
+  (format "%s::%s::%s" whistle-rule-prefix rule-name value-name))
 
 (defun whistle--display-value-name (server-value-name)
   "Extract display value name from server name.
-Example: emacs-my-rule-user-data → user-data"
-  (if (string-match (format "^%s-[^-]+-\\(.+\\)$" (regexp-quote whistle-rule-prefix))
+Example: emacs::my-rule::user-data → user-data"
+  (if (string-match (format "^%s::[^:]+::\\(.+\\)$" (regexp-quote whistle-rule-prefix))
                     server-value-name)
       (match-string 1 server-value-name)
     server-value-name))
@@ -148,7 +148,7 @@ Example: emacs-my-rule-user-data → user-data"
   "Check if NAME is managed by Emacs.
 For rules, this is handled by group membership.
 For values, check the prefix."
-  (string-prefix-p (concat whistle-rule-prefix "-") name))
+  (string-prefix-p (concat whistle-rule-prefix "::") name))
 
 ;;; Hash Utilities
 
@@ -435,8 +435,14 @@ Returns a plist with :rules and :values."
 
     (message "Syncing to whistle server (as %s)..." server-rule-name)
 
-    ;; Transform value references in rules from {name} to {emacs-rule-name}
-    (let ((transformed-rules rules-content))
+    ;; Transform value references in rules
+    ;; Strategy:
+    ;; 1. For locally defined values: {name} → {emacs-current-rule-name}
+    ;; 2. For server values: {name} → {emacs-other-rule-name} (lookup from cache)
+    (let ((transformed-rules rules-content)
+          (local-value-names (mapcar #'car values-alist)))
+
+      ;; First pass: transform locally defined values
       (dolist (value values-alist)
         (let ((display-name (car value))
               (server-name (whistle--server-value-name current-rule-name (car value))))
@@ -446,6 +452,34 @@ Returns a plist with :rules and :values."
                  (format "{%s}" server-name)
                  transformed-rules))
           (push server-name value-names)))
+
+      ;; Second pass: find all remaining {value} references and resolve them
+      ;; These are references to server values not defined locally
+      (let ((unresolved-refs nil))
+        (with-temp-buffer
+          (insert transformed-rules)
+          (goto-char (point-min))
+          (while (re-search-forward "{\\([^}]+\\)}" nil t)
+            (let ((ref (match-string 1)))
+              ;; Check if this is NOT already an emacs-* reference
+              ;; and NOT a local value we just transformed
+              (unless (or (string-prefix-p whistle-rule-prefix ref)
+                         (member ref value-names))
+                (push ref unresolved-refs)))))
+
+        ;; Resolve unresolved references from server cache
+        (dolist (ref (delete-dups unresolved-refs))
+          (let ((full-server-name (whistle--get-server-value-full-name ref)))
+            (if full-server-name
+                (progn
+                  (setq transformed-rules
+                        (replace-regexp-in-string
+                         (regexp-quote (format "{%s}" ref))
+                         (format "{%s}" full-server-name)
+                         transformed-rules))
+                  (message "Resolved server value reference: %s → %s" ref full-server-name))
+              ;; Warning: reference to undefined value
+              (message "⚠️  Warning: Value '%s' not found (not defined locally or on server)" ref)))))
 
       ;; Ensure group exists first, then sync rule
       (let ((group-name (whistle--group-name)))
@@ -490,8 +524,8 @@ Returns a plist with :rules and :values."
          (lambda (values-data)
            (let* ((all-server-values (mapcar (lambda (v) (cdr (assoc 'name v)))
                                              (cdr (assoc 'list values-data))))
-                  ;; Build expected value prefix for this rule
-                  (value-prefix (format "%s-%s-" whistle-rule-prefix current-rule-name))
+                  ;; Build expected value prefix for this rule (format: emacs::rule-name::)
+                  (value-prefix (format "%s::%s::" whistle-rule-prefix current-rule-name))
                   ;; Find all values belonging to this rule on server
                   (rule-server-values (cl-remove-if-not
                                       (lambda (name) (string-prefix-p value-prefix name))
@@ -624,8 +658,8 @@ If RULE-NAME is nil, prompt for it."
     (,(regexp-opt whistle-protocols 'symbols) . font-lock-keyword-face)
     ;; URLs and domains
     ("\\(https?://\\|wss?://\\)[^ \t\n]+" . font-lock-string-face)
-    ;; Value references in rules: {value-name}
-    ("{\\([a-zA-Z0-9._-]+\\)}" 1 font-lock-variable-name-face)
+    ;; Value references in rules: {value-name} or {emacs::rule::value}
+    ("{\\([a-zA-Z0-9._:-]+\\)}" 1 font-lock-variable-name-face)
     ;; Pattern matching operators
     ("\\^\\|\\$\\|\\*\\|?" . font-lock-builtin-face)
     ;; IP addresses
@@ -637,7 +671,7 @@ If RULE-NAME is nil, prompt for it."
 ;;; Auto-completion
 
 (defvar whistle--cached-server-values nil
-  "Cached list of value names from server (emacs group only).")
+  "Cached alist of server values: (display-name . full-server-name).")
 
 (defvar whistle--server-values-cache-time nil
   "Time when server values were last cached.")
@@ -658,38 +692,24 @@ If RULE-NAME is nil, prompt for it."
 
 (defun whistle--parse-server-value-name (server-value-name)
   "Parse server value name to extract the display name.
-Example: emacs-my-rule-user-data → user-data
+Example: emacs::my-rule::user-data → user-data
 
-Note: This assumes value names don't contain hyphens in rule names with hyphens.
-The parsing extracts everything after the last occurrence of 'prefix-' pattern."
-  (if (string-match (format "^%s-\\(.+\\)$" (regexp-quote whistle-rule-prefix))
+Uses :: separator for precise parsing without ambiguity."
+  (if (string-match (format "^%s::[^:]+::\\(.+\\)$" (regexp-quote whistle-rule-prefix))
                     server-value-name)
-      ;; Got: "my-rule-user-data", now find the last segment after removing rule
-      ;; Since we can't reliably parse without knowing the rule name,
-      ;; we return the full name minus the prefix for now
       (match-string 1 server-value-name)
     nil))
 
 (defun whistle--get-server-value-display-name (server-value-name)
-  "Get display name for a server value, attempting to extract just the value part.
-For emacs-RULE-VALUE format, tries to extract VALUE.
-Falls back to full name minus prefix if parsing is ambiguous."
-  (let ((without-prefix (whistle--parse-server-value-name server-value-name)))
-    (if without-prefix
-        ;; Try to find if there's metadata for current rule
-        (if whistle--current-rule-name
-            ;; We know the current rule, so we can extract precisely
-            (let ((rule-prefix (concat whistle--current-rule-name "-")))
-              (if (string-prefix-p rule-prefix without-prefix)
-                  (substring without-prefix (length rule-prefix))
-                ;; Not for current rule, return as-is
-                without-prefix))
-          ;; No current rule context, return without main prefix
-          without-prefix)
-      server-value-name)))
+  "Get display name for a server value, extracting just the value part.
+For emacs::RULE::VALUE format, extracts VALUE.
+Falls back to full name if parsing fails."
+  (let ((parsed (whistle--parse-server-value-name server-value-name)))
+    (or parsed server-value-name)))
 
 (defun whistle--get-server-values-async (callback)
-  "Asynchronously fetch all Emacs-managed values from server and call CALLBACK with results."
+  "Asynchronously fetch all Emacs-managed values from server.
+Calls CALLBACK with an alist of (display-name . full-server-name)."
   (whistle--http-get
    "/cgi-bin/values/list"
    (lambda (data)
@@ -699,19 +719,20 @@ Falls back to full name minus prefix if parsing is ambiguous."
                             (let ((name (alist-get 'name v)))
                               (and name (whistle--is-emacs-managed-p name))))
                           all-values))
-            (display-names (delq nil
-                                (mapcar (lambda (v)
-                                         (whistle--get-server-value-display-name
-                                          (alist-get 'name v)))
-                                       emacs-values))))
-       (funcall callback display-names)))
+            ;; Build alist: (display-name . full-server-name)
+            (value-alist (mapcar (lambda (v)
+                                  (let ((server-name (alist-get 'name v)))
+                                    (cons (whistle--get-server-value-display-name server-name)
+                                          server-name)))
+                                emacs-values)))
+       (funcall callback value-alist)))
    (lambda (err)
      (message "Failed to fetch server values: %s" err)
      (funcall callback nil))))
 
 (defun whistle--get-server-values-cached ()
-  "Get server values with caching.
-Returns cached values if available and not expired, otherwise returns local values only."
+  "Get server values alist with caching.
+Returns alist of (display-name . full-server-name)."
   (let ((now (float-time)))
     (if (and whistle--cached-server-values
              whistle--server-values-cache-time
@@ -727,11 +748,16 @@ Returns cached values if available and not expired, otherwise returns local valu
       ;; Return cached values if available, or empty list
       (or whistle--cached-server-values '()))))
 
+(defun whistle--get-server-value-full-name (display-name)
+  "Get the full server name for a DISPLAY-NAME from cache.
+Returns nil if not found in server values."
+  (cdr (assoc display-name (whistle--get-server-values-cached))))
+
 (defun whistle--get-all-value-names ()
   "Get all value names from both current buffer and server.
-Combines local value names with cached server values, removing duplicates."
+Returns a list of display names only."
   (let ((local-names (whistle--get-value-names))
-        (server-names (whistle--get-server-values-cached)))
+        (server-names (mapcar #'car (whistle--get-server-values-cached))))
     (delete-dups (append local-names server-names))))
 
 (defun whistle-completion-at-point ()
@@ -1065,12 +1091,10 @@ Tries to load from local file first, then from server if not found locally."
                 (seq-filter
                  (lambda (value)
                    (let ((value-name (cdr (assoc 'name value))))
-                     ;; Check if it's an emacs-managed value
-                     (when (string-match (format "^%s:\\([^:]+\\):" whistle-rule-prefix)
+                     ;; Check if it's an emacs-managed value (format: emacs::rule::value)
+                     (when (string-match (format "^%s::\\([^:]+\\)::" (regexp-quote whistle-rule-prefix))
                                        value-name)
-                       (let ((rule-name (match-string 0 value-name)))
-                         ;; Remove trailing colon
-                         (setq rule-name (substring rule-name 0 -1))
+                       (let ((rule-name (match-string 1 value-name)))
                          ;; Check if the rule doesn't exist
                          (not (member rule-name rule-names))))))
                  all-values)))
